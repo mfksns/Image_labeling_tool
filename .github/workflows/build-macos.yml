@@ -1,5 +1,9 @@
 name: Build macOS App (Dual Architecture)
 
+permissions:
+  contents: write
+  packages: write
+
 on:
   push:
     tags:
