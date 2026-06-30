@@ -36,7 +36,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --onedir --windowed \
             --name "Image_labeling_tool" \
-            --icon "icon.ico" \
+            --icon "assets/icon.icns" \
             main.py
 
       - name: Compress App
