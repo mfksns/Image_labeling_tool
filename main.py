@@ -206,7 +206,7 @@ class ImageLoaderWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("图片标签管理工具 v1.0.9")
+        self.setWindowTitle("图片标签管理工具 v1.1.0")
         self.resize(1400, 900)
         self.db = DatabaseManager()
         self.current_image_path = None
@@ -216,6 +216,10 @@ class MainWindow(QMainWindow):
 
         self.cache_date = {'year': '', 'month': '', 'day': ''}
         self.cache_loc = {'province': '', 'city': '', 'district': ''}
+        
+        # 【核心修复】在初始化 UI 之前，必须先初始化数据库连接！
+        # 否则 init_ui 末尾调用 load_image_list 时，business_cursor 为 None 会导致崩溃。
+        self.db.switch_business_database(self.current_folder_path)
         
         self.init_ui()
 
