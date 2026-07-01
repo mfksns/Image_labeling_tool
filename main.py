@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 import sys
 import os
 import sqlite3
 import hashlib
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QLineEdit, QLabel,
+                               QHBoxLayout, QGridLayout, QPushButton, QLineEdit, QLabel,
                                QTreeView, QFileSystemModel, QSplitter, QGroupBox,
                                QTextEdit, QListWidget, QListWidgetItem,
                                QScrollArea, QMessageBox, QFileDialog, QSizePolicy,
@@ -20,14 +20,35 @@ except ImportError:
     PIL_AVAILABLE = False
 
 # ==========================================
-# 1. 数据库管理模块
+# 【新增】自定义 QLabel，实现图片等比例缩放与居中
 # ==========================================
+class ScaledPixmapLabel(QLabel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pixmap = None
+        self.setAlignment(Qt.AlignCenter)
+
+    def setPixmap(self, pixmap):
+        self._pixmap = pixmap
+        if pixmap and not pixmap.isNull():
+            # 等比例缩放并居中
+            scaled = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            super().setPixmap(scaled)
+        else:
+            super().setPixmap(pixmap)
+
+    def resizeEvent(self, event):
+        # 当窗口大小改变时，重新计算缩放比例
+        if self._pixmap and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            super().setPixmap(scaled)
+        super().resizeEvent(event)
+
 # ==========================================
 # 1. 数据库管理模块 (已清理无用分类代码)
 # ==========================================
 class DatabaseManager:
     def __init__(self):
-        # 移除了 config_conn 等配置数据库相关变量
         self.business_conn = None
         self.business_cursor = None
         self.current_business_path = None
@@ -39,12 +60,10 @@ class DatabaseManager:
         business_file = os.path.join(folder_path, "image_tags.db")
         self.business_conn = sqlite3.connect(business_file)
         self.business_cursor = self.business_conn.cursor()
-        # 【新增】强制确保数据库使用 UTF-8 编码（如果是新建库则生效，已存在库会保持原样）
         self.business_cursor.execute('PRAGMA encoding = "UTF-8";') 
         self._init_business_tables()
 
     def _init_business_tables(self): 
-        # 只保留 images 表，去掉了 image_categories 表
         self.business_cursor.executescript("""
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +81,6 @@ class DatabaseManager:
             );
         """)
         
-        # 兼容旧版数据库升级
         try: self.business_cursor.execute("ALTER TABLE images DROP COLUMN rating")
         except: pass
         
@@ -79,7 +97,6 @@ class DatabaseManager:
                                     (file_path, file_name, file_size))
         self.business_conn.commit()
         
-        # 明确指定列顺序，防止数据错位
         self.business_cursor.execute(
             "SELECT id, file_path, file_name, file_size, md5_hash, comment, year, month, day, province, city, district "
             "FROM images WHERE file_path = ?", 
@@ -104,8 +121,6 @@ class DatabaseManager:
                                      (new_path, new_name, old_path))
         self.business_conn.commit()
 
-    # 【已删除】以下方法全部移除：get_all_categories, add_category, update_category_name, toggle_category_status, delete_category
-
 # ==========================================
 # 2. 异步线程
 # ==========================================
@@ -114,6 +129,7 @@ class MD5Worker(QThread):
     def __init__(self, file_path):
         super().__init__()
         self.file_path = file_path
+
     def run(self):
         md5 = hashlib.md5()
         try:
@@ -128,38 +144,76 @@ class ImageLoaderWorker(QThread):
         super().__init__()
         self.file_path = file_path
         self.max_size = max_size
+
     def run(self):
-        try:
-            if PIL_AVAILABLE:
+        # ==========================================
+        # 第一层：尝试使用 Pillow (处理特殊色彩模式)
+        # ==========================================
+        if PIL_AVAILABLE:
+            # 【核心修复】解除 2 亿像素限制，防止超大卫星图直接触发 DecompressionBombError
+            Image.MAX_IMAGE_PIXELS = None 
+            try:
                 with Image.open(self.file_path) as img:
-                    if img.mode in ('RGBA', 'P', 'LA'): img = img.convert('RGB')
-                    img.thumbnail((self.max_size.width(), self.max_size.height()), Image.Resampling.LANCZOS)
+                    try: img.draft('RGB', (self.max_size.width(), self.max_size.height()))
+                    except: pass
+                    
+                    try: resample = Image.Resampling.LANCZOS
+                    except AttributeError: resample = Image.ANTIALIAS
+                    
+                    # 先缩小，再转色
+                    img.thumbnail((self.max_size.width(), self.max_size.height()), resample)
+                    if img.mode != 'RGB': img = img.convert('RGB')
+                    
                     img_bytes = img.tobytes()
                     qimg = QImage(img_bytes, img.width, img.height, img.width * 3, QImage.Format_RGB888)
-                    self.image_loaded.emit(QPixmap.fromImage(qimg), f"{img.width}×{img.height}")
-            else:
-                pixmap = QPixmap(self.file_path)
-                if not pixmap.isNull():
-                    if pixmap.width() > self.max_size.width() or pixmap.height() > self.max_size.height():
-                        pixmap = pixmap.scaled(self.max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    self.image_loaded.emit(pixmap, f"{pixmap.width()}×{pixmap.height()}")
-                else: self.image_loaded.emit(QPixmap(), "不支持的格式")
-        except Exception: self.image_loaded.emit(QPixmap(), "加载失败")
+                    pixmap = QPixmap.fromImage(qimg)
+                    self.image_loaded.emit(pixmap, f"{img.width}×{img.height} (Pillow加载)")
+                    return # 成功则直接结束
+            except MemoryError:
+                print("Pillow 内存溢出，准备降级到 Qt 底层...")
+            except Exception as e:
+                print(f"Pillow 加载异常: {e}，准备降级到 Qt 底层...")
+
+        # ==========================================
+        # 第二层：降级使用 Qt 原生 QImageReader (杀手锏)
+        # 利用 C++ 底层直接缩放，绕过 Python 内存瓶颈，支持读取 TIFF 金字塔
+        # ==========================================
+        try:
+            from PySide6.QtGui import QImageReader
+            reader = QImageReader(self.file_path)
+            
+            # 【核心杀手锏】让 Qt 在 C++ 底层解码时直接缩放
+            # 如果 TIFF 包含金字塔图层，Qt 会直接读取缩小版，内存占用极小！
+            reader.setScaledSize(self.max_size)
+            reader.setQuality(50) # 适当降低质量换取加载速度
+            
+            qimg = reader.read()
+            if not qimg.isNull():
+                pixmap = QPixmap.fromImage(qimg)
+                self.image_loaded.emit(pixmap, f"{qimg.width()}×{qimg.height()} (Qt底层加速加载)")
+                return
+        except Exception as e:
+            print(f"Qt 原生加载异常: {e}")
+
+        # ==========================================
+        # 彻底失败
+        # ==========================================
+        self.image_loaded.emit(QPixmap(), "❌ 文件过大/格式特殊，超出预览极限")
 
 # ==========================================
-# 4. 主窗口 (增加日期输入校验)
+# 4. 主窗口
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("图片标签管理工具 v0.2")
+        self.setWindowTitle("图片标签管理工具 v1.0.9")
         self.resize(1400, 900)
         self.db = DatabaseManager()
         self.current_image_path = None
         self.current_folder_path = os.getcwd()
         self.md5_worker = None
         self.image_loader = None
-        
+
         self.cache_date = {'year': '', 'month': '', 'day': ''}
         self.cache_loc = {'province': '', 'city': '', 'district': ''}
         
@@ -175,7 +229,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(5, 5, 5, 5)
 
-        btn_open = QPushButton("  打开文件夹")
+        btn_open = QPushButton("打开文件夹")
         btn_open.clicked.connect(self.open_folder)
         
         self.path_label = QLineEdit()
@@ -218,11 +272,13 @@ class MainWindow(QMainWindow):
 
         preview_group = QGroupBox("🖼️ 图片预览")
         preview_layout = QVBoxLayout()
-        self.preview_label = QLabel("请选择图片")
-        self.preview_label.setAlignment(Qt.AlignCenter)
+        
+        # 【修改】使用自定义的 ScaledPixmapLabel 替代普通 QLabel，实现完美等比例缩放
+        self.preview_label = ScaledPixmapLabel("请选择图片")
         self.preview_label.setMinimumSize(400, 300)
         self.preview_label.setStyleSheet("QLabel { background-color: #f0f0f0; border: 1px solid #ccc; }")
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
         self.lbl_image_info = QLabel("")
         self.lbl_image_info.setAlignment(Qt.AlignCenter)
         self.lbl_image_info.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
@@ -249,7 +305,6 @@ class MainWindow(QMainWindow):
         self.in_month = QLineEdit(); self.in_month.setPlaceholderText("月"); self.in_month.setFixedWidth(120)
         self.in_day = QLineEdit(); self.in_day.setPlaceholderText("日"); self.in_day.setFixedWidth(120)
         
-        # 【新增】限制只能输入数字
         num_validator = QRegularExpressionValidator(QRegularExpression(r"\d*"))
         self.in_year.setValidator(num_validator)
         self.in_month.setValidator(num_validator)
@@ -308,11 +363,11 @@ class MainWindow(QMainWindow):
         loc_cache_layout.addWidget(self.cache_dist)
         loc_cache_layout.addStretch()
 
-        loc_layout.addLayout(loc_input_layout)
+        loc_layout.addLayout(loc_input_layout) 
         loc_layout.addLayout(loc_cache_layout)
         loc_group.setLayout(loc_layout)
 
-        comment_group = QGroupBox(" 📝 注释")
+        comment_group = QGroupBox("📝 注释")
         comment_layout = QVBoxLayout()
         self.txt_comment = QLineEdit()
         self.txt_comment.setPlaceholderText("输入注释 (最大30字)")
@@ -320,11 +375,26 @@ class MainWindow(QMainWindow):
         comment_layout.addWidget(self.txt_comment)
         comment_group.setLayout(comment_layout)
 
-        right_layout.addWidget(preview_group, 3)
-        right_layout.addWidget(rename_group)
-        right_layout.addWidget(date_group)
-        right_layout.addWidget(loc_group)
-        right_layout.addWidget(comment_group)
+        # 图片预览保持在最上方，下方放置田字型网格布局
+        right_layout.addWidget(preview_group, 1)
+        
+        # 【修改】使用 QGridLayout 实现四个区域的田字型布局
+        grid_layout = QGridLayout()
+        grid_layout.addWidget(date_group, 0, 0)    # 第0行第0列 (左上)：日期时间
+        grid_layout.addWidget(rename_group, 0, 1)  # 第0行第1列 (右上)：修改文件名
+        grid_layout.addWidget(loc_group, 1, 0)     # 第1行第0列 (左下)：所在地区
+        grid_layout.addWidget(comment_group, 1, 1) # 第1行第1列 (右下)：注释
+        
+        # 设置列拉伸因子，确保左右两列宽度平均分配
+        grid_layout.setColumnStretch(0, 1)
+        grid_layout.setColumnStretch(1, 1)
+        
+        # 【新增】强制限制四个功能模块的高度，使其适应内容，不被撑开
+        for group in [date_group, loc_group, rename_group, comment_group]:
+            # 水平方向保持扩展 (Expanding)，垂直方向限制为最大内容高度 (Maximum)
+            group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            
+        right_layout.addLayout(grid_layout, 0)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_widget)
@@ -333,7 +403,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
 
-        # 应用蓝色按钮样式
         blue_btn_style = """
             QPushButton {
                 background-color: #0078D4;
@@ -376,7 +445,6 @@ class MainWindow(QMainWindow):
         widget.setFixedWidth(width) 
         return widget
 
-    # 【修改】绑定输入事件，增加校验拦截
     def _bind_inputs(self):
         inputs = [
             (self.in_year, 'year'), (self.in_month, 'month'), (self.in_day, 'day'),
@@ -385,28 +453,18 @@ class MainWindow(QMainWindow):
         for inp, key in inputs:
             inp.editingFinished.connect(lambda k=key: self.on_input_finished(k))
 
-    # 【修改】输入完成时的统一处理入口
     def on_input_finished(self, key):
-        # 如果是日期字段，先进行范围校验
         if key in self.cache_date:
             line_edit = self.in_year if key=='year' else (self.in_month if key=='month' else self.in_day)
             if not self.validate_date(key, line_edit):
-                # 【核心修复】校验失败时，validate_date 内部已经执行了 line_edit.clear() 清空了输入框。
-                # 此时我们不能直接 return，而是应该调用 update_cache_from_input，
-                # 这样会把“空值”保存进数据库，覆盖掉旧的错误数据或旧的正确数据。
-                # 从而让左侧列表正确判断为“未标记”（如果其他字段也为空）。
                 self.update_cache_from_input(key)
                 return  
-        
-        # 校验通过或非日期字段，执行原有的缓存更新和保存
         self.update_cache_from_input(key)
 
-    # 【新增】日期校验逻辑
     def validate_date(self, key, line_edit):
         text = line_edit.text().strip()
         if not text:
-            return True  # 允许为空
-            
+            return True
         if key == 'year':
             if not (text.isdigit() and len(text) == 4):
                 QMessageBox.warning(self, "输入错误", "年份必须是4位数字！")
@@ -556,12 +614,9 @@ class MainWindow(QMainWindow):
 
         def safe_get(idx, default=''):
             return img_data[idx] if idx < len(img_data) and img_data[idx] else default
-
-        # 【核心修复】根据 SELECT 语句的顺序重新分配索引：
-        # 5: comment, 6: year, 7: month, 8: day, 9: province, 10: city, 11: district
         
         self.txt_comment.blockSignals(True)
-        self.txt_comment.setText(safe_get(5))  # 注释在索引 5
+        self.txt_comment.setText(safe_get(5))
         self.txt_comment.blockSignals(False)
 
         self.in_year.setText(safe_get(6)); self.in_month.setText(safe_get(7)); self.in_day.setText(safe_get(8))
@@ -576,8 +631,10 @@ class MainWindow(QMainWindow):
         self.image_loader.start()
 
     def on_image_loaded(self, pixmap, info_text):
-        if not pixmap.isNull(): self.preview_label.setPixmap(pixmap)
-        else: self.preview_label.setText("无法预览")
+        if not pixmap.isNull(): 
+            self.preview_label.setPixmap(pixmap)
+        else: 
+            self.preview_label.setText("无法预览")
         self.lbl_image_info.setText(info_text)
 
     def start_md5_calc(self, file_path):
